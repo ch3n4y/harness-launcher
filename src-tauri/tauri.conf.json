@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Harness Launcher",
+  "version": "0.1.0",
+  "identifier": "local.harness.launcher",
+  "build": { "frontendDist": "../src" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{ "title": "Harness Launcher", "width": 420, "height": 470, "minWidth": 360, "minHeight": 440 }],
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"], "windows": { "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true } }, "macOS": { "minimumSystemVersion": "11.0" } }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "harness-launcher",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness service launcher",
+  "author": "Harness Launcher contributors",
+  "license": "MIT",
+  "scripts": { "start": "tauri dev", "test": "cargo test --manifest-path src-tauri/Cargo.toml", "build": "tauri build", "dist:win": "tauri build --bundles nsis", "dist:mac": "tauri build --bundles dmg" },
+  "devDependencies": { "@tauri-apps/cli": "2.11.4" }
+}
