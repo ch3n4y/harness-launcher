@@ -76,6 +76,10 @@ jobs:
         run: |
           mkdir -p publish
           find release-assets -type f \( -name '*.exe' -o -name '*.dmg' \) -exec cp {} publish/ \;
+          for file in publish/*; do
+            normalized="${file// /.}"
+            if [ "$file" != "$normalized" ]; then mv "$file" "$normalized"; fi
+          done
           cd publish
           sha256sum *.exe *.dmg > SHA256SUMS.txt
           cd ..
