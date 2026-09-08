@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Write,
     io::{BufRead, BufReader, Read},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -151,6 +152,26 @@ fn candidates() -> Vec<String> {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|p| p.join(executable))
             .collect();
+    for key in ["NVM_BIN", "NVM_SYMLINK"] {
+        if let Some(dir) = std::env::var_os(key) {
+            paths.push(PathBuf::from(dir).join(executable));
+        }
+    }
+    // Finder-launched applications do not inherit the terminal's nvm PATH.
+    #[cfg(unix)]
+    {
+        let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+        let mut cmd = command(Path::new(&shell));
+        cmd.args(["-lic", "printf '\nHARNESS_PATH=%s\n' \"$PATH\""]);
+        if let Ok(output) = capture(cmd) {
+            if let Some(value) = output
+                .lines()
+                .find_map(|line| line.strip_prefix("HARNESS_PATH="))
+            {
+                paths.extend(std::env::split_paths(value).map(|p| p.join(executable)));
+            }
+        }
+    }
     if cfg!(windows) {
         for p in [
             "scoop/apps/nodejs-lts/current/node.exe",
@@ -177,7 +198,13 @@ fn candidates() -> Vec<String> {
         }
     }
     for (root, suffix) in [
-        (home.join(".nvm/versions/node"), "bin/node"),
+        (
+            std::env::var_os("NVM_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".nvm"))
+                .join("versions/node"),
+            "bin/node",
+        ),
         (
             home.join(".local/share/fnm/node-versions"),
             "installation/bin/node",
@@ -195,8 +222,12 @@ fn candidates() -> Vec<String> {
         }
     }
     let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for p in paths {
-        if p.is_file() {
+        if p.is_absolute()
+            && p.is_file()
+            && seen.insert(fs::canonicalize(&p).unwrap_or_else(|_| p.clone()))
+        {
             let p = p.to_string_lossy().to_string();
             if !result.contains(&p) {
                 result.push(p);
@@ -269,25 +300,34 @@ fn detect(s: &SharedState) -> Result<()> {
     let paths = if config.node.is_empty() {
         found.clone()
     } else {
-        vec![config.node]
+        vec![config.node.clone()]
     };
     {
         let mut m = s.model.lock().unwrap();
         m.snapshot.candidates = found;
         m.snapshot.runtime = None;
     }
+    let rt = choose_runtime(paths.iter().map(|node| inspect(node, &config.cwd)))?;
+    s.model.lock().unwrap().snapshot.runtime = Some(rt);
+    Ok(())
+}
+fn choose_runtime(runtimes: impl IntoIterator<Item = Result<Runtime>>) -> Result<Runtime> {
     let mut error = "未找到 Node，请安装或手动选择".to_string();
-    for node in paths {
-        match inspect(&node, &config.cwd) {
+    let mut fallback = None;
+    for runtime in runtimes {
+        match runtime {
+            Ok(rt) if rt.entry.is_some() => return Ok(rt),
             Ok(rt) => {
-                s.model.lock().unwrap().snapshot.runtime = Some(rt);
-                return Ok(());
+                if fallback.is_none() {
+                    fallback = Some(rt);
+                }
             }
             Err(e) => error = e,
         }
     }
-    Err(error)
+    fallback.ok_or(error)
 }
+
 fn pipe(s: &SharedState, child: &mut Child) {
     fn stream(s: SharedState, input: impl Read + Send + 'static) {
         thread::spawn(move || {
@@ -630,6 +670,225 @@ async fn action(
     .await
     .map_err(|e| e.to_string())?
 }
+const RELEASE_API: &str = "https://api.github.com/repos/ch3n4y/harness-launcher/releases/latest";
+static UPDATING: AtomicBool = AtomicBool::new(false);
+fn release_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent("harness-launcher")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())
+}
+fn release_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<reqwest::blocking::Response> {
+    if url != RELEASE_API
+        && !url.starts_with("https://github.com/ch3n4y/harness-launcher/releases/download/")
+    {
+        return Err("无效的发布资源地址".into());
+    }
+    client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())
+}
+fn release_info(client: &reqwest::blocking::Client) -> Result<serde_json::Value> {
+    let text = release_get(client, RELEASE_API)?
+        .text()
+        .map_err(|e| e.to_string())?;
+    let release: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    parse_release(&release, std::env::consts::OS, std::env::consts::ARCH)
+}
+fn parse_release(release: &serde_json::Value, os: &str, arch: &str) -> Result<serde_json::Value> {
+    let version = release["tag_name"]
+        .as_str()
+        .ok_or("发布版本缺失")?
+        .trim_start_matches('v');
+    let latest = semver::Version::parse(version).map_err(|e| e.to_string())?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let suffix = match (os, arch) {
+        ("macos", "aarch64" | "x86_64") => "_universal.dmg",
+        ("windows", "x86_64") => "_x64-setup.exe",
+        _ => "unsupported-platform",
+    };
+    let assets = release["assets"].as_array().ok_or("发布资源缺失")?;
+    let asset = assets
+        .iter()
+        .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suffix)));
+    let checksum = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt");
+    Ok(
+        serde_json::json!({"current":current.to_string(), "latest":latest.to_string(),
+        "available":latest > current, "notes":release["body"],
+        "asset":asset, "checksum":checksum}),
+    )
+}
+#[tauri::command]
+async fn launcher_update(
+    state: tauri::State<'_, SharedState>,
+    install: bool,
+) -> Result<serde_json::Value> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if UPDATING.swap(true, Ordering::SeqCst) {
+            return Err("正在检查或下载更新".into());
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                UPDATING.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        struct BusyGuard(Option<SharedState>);
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                if let Some(s) = &self.0 {
+                    s.model.lock().unwrap().snapshot.busy = false;
+                }
+            }
+        }
+        let _busy = if install {
+            let mut m = s.model.lock().unwrap();
+            if s.quitting.load(Ordering::SeqCst) || m.service.is_some() || m.snapshot.busy {
+                return Err("请先停止服务并等待当前操作完成，再更新启动器".into());
+            }
+            m.snapshot.busy = true;
+            BusyGuard(Some(s.clone()))
+        } else {
+            BusyGuard(None)
+        };
+        let client = release_client()?;
+        let info = release_info(&client)?;
+        if !install {
+            return Ok(info);
+        }
+        if info["available"] != true {
+            return Err("当前已是最新版本".into());
+        }
+        let asset = &info["asset"];
+        let name = asset["name"].as_str().ok_or("此平台暂无安装包")?;
+        if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+            return Err("安装包名称无效".into());
+        }
+        let checks = release_get(
+            &client,
+            info["checksum"]["browser_download_url"]
+                .as_str()
+                .ok_or("发布缺少 SHA256 校验文件")?,
+        )?
+        .text()
+        .map_err(|e| e.to_string())?;
+        let expected = checks
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                (parts.next()?.trim_start_matches('*') == name).then_some(hash)
+            })
+            .ok_or("未找到安装包校验值")?;
+        let directory = s.file.parent().ok_or("配置目录无效")?.join("updates");
+        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let path = directory.join(name);
+        let partial = directory.join(format!("{name}.part"));
+        let result = (|| {
+            use sha2::{Digest, Sha256};
+            let mut response = release_get(
+                &client,
+                asset["browser_download_url"]
+                    .as_str()
+                    .ok_or("下载地址缺失")?,
+            )?;
+            let mut file = fs::File::create(&partial).map_err(|e| e.to_string())?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = response.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..count])
+                    .map_err(|e| e.to_string())?;
+                hash.update(&buffer[..count]);
+            }
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+            if format!("{:x}", hash.finalize()) != expected.to_lowercase() {
+                return Err("SHA256 校验失败，请重新下载".into());
+            }
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+            fs::rename(&partial, &path).map_err(|e| e.to_string())?;
+            open::that(&path).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"path":path, "opened":true}))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(partial);
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn window_action(window: tauri::WebviewWindow, name: String, height: Option<f64>) -> Result<()> {
+    match name.as_str() {
+        "hide" => window.hide(),
+        "minimize" => window.minimize(),
+        "drag" => window.start_dragging(),
+        "resize" => {
+            let requested = height.filter(|h| h.is_finite()).ok_or("无效的窗口高度")?;
+            let monitor = window.current_monitor().map_err(|e| e.to_string())?;
+            let max_height = monitor
+                .map(|m| m.size().height as f64 / m.scale_factor() - 80.0)
+                .unwrap_or(900.0)
+                .max(300.0);
+            let size = window.inner_size().map_err(|e| e.to_string())?;
+            let scale = window.scale_factor().map_err(|e| e.to_string())?;
+            window.set_size(tauri::LogicalSize::new(
+                size.width as f64 / scale,
+                requested.clamp(300.0, max_height),
+            ))
+        }
+        _ => return Err("未知窗口操作".into()),
+    }
+    .map_err(|e| e.to_string())
+}
+fn tray_actions(
+    status: &str,
+    busy: bool,
+    installed: bool,
+) -> Vec<(&'static str, &'static str, bool)> {
+    let mut items = vec![("show", "显示窗口", true)];
+    match status {
+        "running" => items.extend([
+            ("open", "打开浏览器", true),
+            ("stop", "停止服务", !busy),
+            ("restart", "重启服务", !busy),
+        ]),
+        "starting" => items.push(("stop", "停止服务", !busy)),
+        "stopping" => items.push(("status", "正在停止…", false)),
+        "installing" => items.push(("status", "正在安装…", false)),
+        _ => items.push(("start", "启动服务", !busy && installed)),
+    }
+    items.push(("quit", "退出", true));
+    items
+}
+fn tray_menu(
+    app: &tauri::AppHandle,
+    status: &str,
+    busy: bool,
+    installed: bool,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    for (id, title, enabled) in tray_actions(status, busy, installed) {
+        menu.append(&MenuItem::with_id(app, id, title, enabled, None::<&str>)?)?;
+    }
+    Ok(menu)
+}
 fn show(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -691,19 +950,8 @@ fn main() {
                 quitting: AtomicBool::new(false),
             });
             app.manage(state.clone());
-            let items = [
-                ("show", "显示窗口"),
-                ("open", "打开浏览器"),
-                ("start", "启动服务"),
-                ("stop", "停止服务"),
-                ("restart", "重启服务"),
-                ("quit", "退出"),
-            ];
-            let menu = Menu::new(app)?;
-            for (id, title) in items {
-                menu.append(&MenuItem::with_id(app, id, title, true, None::<&str>)?)?;
-            }
-            TrayIconBuilder::new()
+            let menu = tray_menu(app.handle(), "stopped", true, false)?;
+            TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("Harness Launcher")
                 .menu(&menu)
@@ -725,6 +973,38 @@ fn main() {
                     });
                 })
                 .build(app)?;
+            let tray_state = state.clone();
+            let tray_app = app.handle().clone();
+            thread::spawn(move || {
+                let mut previous = None;
+                while !tray_state.quitting.load(Ordering::SeqCst) {
+                    let key = {
+                        let m = tray_state.model.lock().unwrap();
+                        (
+                            m.snapshot.status.clone(),
+                            m.snapshot.busy,
+                            m.snapshot
+                                .runtime
+                                .as_ref()
+                                .is_some_and(|rt| rt.entry.is_some()),
+                        )
+                    };
+                    if previous.as_ref() != Some(&key) {
+                        if let Some(tray) = tray_app.tray_by_id("main-tray") {
+                            match tray_menu(&tray_app, &key.0, key.1, key.2)
+                                .and_then(|menu| tray.set_menu(Some(menu)))
+                            {
+                                Ok(()) => previous = Some(key),
+                                Err(e) => {
+                                    log(&tray_state, format!("托盘更新失败：{e}"));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(350));
+                }
+            });
             thread::spawn(move || {
                 if let Err(e) = dispatch(&state, "detect", serde_json::Value::Null) {
                     log(&state, e);
@@ -738,7 +1018,11 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![action])
+        .invoke_handler(tauri::generate_handler![
+            action,
+            launcher_update,
+            window_action
+        ])
         .build(tauri::generate_context!())
         .expect("无法初始化启动器")
         .run(|app, event| {
@@ -755,6 +1039,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn runtime_fixture(node: &str, installed: bool) -> Runtime {
+        Runtime {
+            node: node.into(),
+            version: "v24.19.0".into(),
+            npm: String::new(),
+            root: String::new(),
+            prefix: String::new(),
+            harness_version: installed.then(|| "1.0.0".into()),
+            entry: installed.then(|| "dsh.js".into()),
+        }
+    }
+    #[test]
+    fn prefer_dsh_and_respect_explicit_selection() {
+        let rt = choose_runtime(vec![
+            Err("incompatible".into()),
+            Ok(runtime_fixture("first", false)),
+            Ok(runtime_fixture("nvm", true)),
+        ])
+        .unwrap();
+        assert_eq!(rt.node, "nvm");
+        let rt = choose_runtime(vec![
+            Ok(runtime_fixture("first", false)),
+            Ok(runtime_fixture("second", false)),
+        ])
+        .unwrap();
+        assert_eq!(rt.node, "first");
+        assert_eq!(
+            choose_runtime(vec![Ok(runtime_fixture("explicit", false))])
+                .unwrap()
+                .node,
+            "explicit"
+        );
+        assert!(choose_runtime(vec![Err("invalid explicit path".into())]).is_err());
+    }
+    #[test]
+    fn release_matches_universal_for_both_mac_architectures() {
+        let release = serde_json::json!({"tag_name":"v99.0.0", "assets":[
+            {"name":"Harness.Launcher_99.0.0_aarch64.dmg"},
+            {"name":"Harness.Launcher_99.0.0_universal.dmg"},
+            {"name":"Harness.Launcher_99.0.0_x64-setup.exe"},
+            {"name":"SHA256SUMS.txt"}]});
+        for arch in ["aarch64", "x86_64"] {
+            let info = parse_release(&release, "macos", arch).unwrap();
+            assert_eq!(
+                info["asset"]["name"],
+                "Harness.Launcher_99.0.0_universal.dmg"
+            );
+            assert_eq!(info["available"], true);
+        }
+        assert_eq!(
+            parse_release(&release, "windows", "x86_64").unwrap()["asset"]["name"],
+            "Harness.Launcher_99.0.0_x64-setup.exe"
+        );
+        assert!(parse_release(&release, "linux", "x86_64").unwrap()["asset"].is_null());
+        assert!(parse_release(&serde_json::json!({"tag_name":"bad"}), "macos", "aarch64").is_err());
+    }
+    #[test]
+    fn tray_only_offers_actions_for_current_state() {
+        let ids = |status| {
+            tray_actions(status, false, true)
+                .into_iter()
+                .map(|i| i.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("stopped"), ["show", "start", "quit"]);
+        assert_eq!(ids("running"), ["show", "open", "stop", "restart", "quit"]);
+        assert_eq!(ids("starting"), ["show", "stop", "quit"]);
+        assert_eq!(ids("installing"), ["show", "status", "quit"]);
+        assert!(!tray_actions("stopped", false, false)[1].2);
+        assert!(!tray_actions("running", true, true)[2].2);
+    }
     #[test]
     fn version_range() {
         for v in ["v22.19.0", "22.20.1", "24.0.0", "25.1.0"] {
